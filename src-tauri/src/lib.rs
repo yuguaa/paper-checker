@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::Mutex,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{engine::general_purpose, Engine as _};
@@ -20,8 +20,12 @@ use xcap::Monitor;
 const SERVICE_NAME: &str = "com.paper-checker.app";
 const KEYCHAIN_ACCOUNT: &str = "openai-compatible-api-key";
 const CONFIG_FILE: &str = "config.json";
+const MEMORIES_DIR: &str = "memories";
 const MEMORY_WIKI_FILE: &str = "memory-wiki.md";
+const GRADING_RECORDS_FILE: &str = "grading-records.jsonl";
+const CAPTURES_DIR: &str = "captures";
 const MEMORY_PROMPT_CHAR_LIMIT: usize = 6000;
+const GRADE_RECORD_LIMIT: usize = 30;
 
 #[derive(Default)]
 struct AppState {
@@ -33,6 +37,7 @@ struct AppState {
 pub struct ModelConfig {
     base_url: String,
     model: String,
+    memory_key: String,
     has_api_key: bool,
 }
 
@@ -41,6 +46,7 @@ pub struct ModelConfig {
 pub struct ModelConfigInput {
     base_url: String,
     model: String,
+    memory_key: String,
     api_key: Option<String>,
 }
 
@@ -49,6 +55,8 @@ pub struct ModelConfigInput {
 pub struct StoredConfig {
     base_url: String,
     model: String,
+    #[serde(default = "default_memory_key")]
+    memory_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +83,9 @@ pub struct GradeInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GradeResult {
+    record_id: String,
+    record_path: String,
+    timings_ms: Value,
     score: f64,
     max_score: f64,
     level: String,
@@ -103,6 +114,33 @@ pub struct MemoryWikiSaveResult {
     entry: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GradeRecord {
+    id: String,
+    timestamp: u64,
+    memory_key: String,
+    status: String,
+    mode: String,
+    model: String,
+    base_url: String,
+    max_score: f64,
+    score: Option<f64>,
+    level: Option<String>,
+    error: Option<String>,
+    timings_ms: Value,
+    selection: SelectionRect,
+    capture_path: Option<String>,
+    record_path: Option<String>,
+    extracted_text: Option<String>,
+    comments: Option<String>,
+    raw: Option<String>,
+    rubric_excerpt: String,
+    reference_essay_excerpt: String,
+    prompt_excerpt: Option<String>,
+    image_data_url_bytes: Option<usize>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PartialGradeResult {
@@ -129,6 +167,7 @@ async fn load_model_config(app: AppHandle) -> Result<ModelConfig, String> {
     Ok(ModelConfig {
         base_url: stored.base_url,
         model: stored.model,
+        memory_key: stored.memory_key,
         has_api_key: read_api_key().is_ok(),
     })
 }
@@ -140,6 +179,7 @@ async fn save_model_config(app: AppHandle, input: ModelConfigInput) -> Result<Mo
     if model.is_empty() {
         return Err("模型名称不能为空".into());
     }
+    let memory_key = normalize_memory_key(&input.memory_key);
 
     if let Some(api_key) = input
         .api_key
@@ -150,12 +190,17 @@ async fn save_model_config(app: AppHandle, input: ModelConfigInput) -> Result<Mo
         write_api_key(api_key)?;
     }
 
-    let stored = StoredConfig { base_url, model };
+    let stored = StoredConfig {
+        base_url,
+        model,
+        memory_key,
+    };
     write_stored_config(&app, &stored)?;
 
     Ok(ModelConfig {
         base_url: stored.base_url,
         model: stored.model,
+        memory_key: stored.memory_key,
         has_api_key: read_api_key().is_ok(),
     })
 }
@@ -228,8 +273,9 @@ async fn save_score_correction(
     input: CorrectionInput,
 ) -> Result<MemoryWikiSaveResult, String> {
     validate_correction_input(&input)?;
+    let config = read_stored_config(&app)?;
     let corrected_score = clamp_score(input.corrected_score, input.max_score);
-    let path = memory_wiki_path(&app)?;
+    let path = memory_wiki_path_for_key(&app, &config.memory_key)?;
     let needs_header = !path.exists()
         || fs::metadata(&path)
             .map(|meta| meta.len() == 0)
@@ -254,16 +300,101 @@ async fn save_score_correction(
 }
 
 #[tauri::command]
+async fn load_grade_records(app: AppHandle) -> Result<Vec<GradeRecord>, String> {
+    let config = read_stored_config(&app)?;
+    let path = grading_records_path_for_key(&app, &config.memory_key)?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let content = fs::read_to_string(path).map_err(to_error)?;
+    let mut records = content
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<GradeRecord>(line).ok())
+        .take(GRADE_RECORD_LIMIT)
+        .collect::<Vec<_>>();
+    records.shrink_to_fit();
+    Ok(records)
+}
+
+#[tauri::command]
 async fn grade_selection(app: AppHandle, input: GradeInput) -> Result<GradeResult, String> {
+    let total_start = Instant::now();
     validate_grade_input(&input)?;
     let config = read_stored_config(&app)?;
-    let api_key = read_api_key().map_err(|_| "请先保存 API Key".to_string())?;
-    let png = capture_selection_png_for_grading(&app, &input.selection)?;
+    let record_id = format!("grade-{}", unix_millis());
+    let record_path = grading_records_path_for_key(&app, &config.memory_key)?;
+    let mut timings = serde_json::Map::new();
+
+    let api_key = match read_api_key() {
+        Ok(value) => value,
+        Err(_) => {
+            timings.insert("total".into(), json!(elapsed_ms(total_start)));
+            append_grade_record(
+                &app,
+                &config.memory_key,
+                build_grade_record(
+                    &record_id,
+                    unix_seconds(),
+                    &config,
+                    &input,
+                    "error",
+                    Value::Object(timings.clone()),
+                    None,
+                    Some("请先保存 API Key".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(record_path.display().to_string()),
+                ),
+            )?;
+            return Err("请先保存 API Key".to_string());
+        }
+    };
+
+    let capture_start = Instant::now();
+    let png = match capture_selection_png_for_grading(&app, &input.selection) {
+        Ok(value) => {
+            timings.insert("capture".into(), json!(elapsed_ms(capture_start)));
+            value
+        }
+        Err(error) => {
+            timings.insert("capture".into(), json!(elapsed_ms(capture_start)));
+            timings.insert("total".into(), json!(elapsed_ms(total_start)));
+            append_grade_record(
+                &app,
+                &config.memory_key,
+                build_grade_record(
+                    &record_id,
+                    unix_seconds(),
+                    &config,
+                    &input,
+                    "error",
+                    Value::Object(timings.clone()),
+                    None,
+                    Some(error.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(record_path.display().to_string()),
+                ),
+            )?;
+            return Err(error);
+        }
+    };
+
+    let capture_path = save_capture_png(&app, &config.memory_key, &record_id, &png)?;
     let image_url = data_url_from_png(&png);
     let endpoint = format!("{}/chat/completions", normalize_base_url(&config.base_url)?);
-    let memory_wiki = read_memory_wiki_for_prompt(&app)?;
+    let memory_start = Instant::now();
+    let memory_wiki = read_memory_wiki_for_prompt(&app, &config.memory_key)?;
+    timings.insert("memory".into(), json!(elapsed_ms(memory_start)));
     let prompt = build_grading_prompt(&input, &memory_wiki);
 
+    let request_start = Instant::now();
     let request_body = json!({
         "model": config.model,
         "messages": [
@@ -285,9 +416,98 @@ async fn grade_selection(app: AppHandle, input: GradeInput) -> Result<GradeResul
         "temperature": 0.2,
         "max_tokens": 1800
     });
+    timings.insert("requestBuild".into(), json!(elapsed_ms(request_start)));
 
-    let raw = call_chat_completions(&endpoint, &api_key, &request_body).await?;
-    parse_grade_response(&raw, input.max_score)
+    let api_start = Instant::now();
+    let raw = match call_chat_completions(&endpoint, &api_key, &request_body).await {
+        Ok(value) => {
+            timings.insert("api".into(), json!(elapsed_ms(api_start)));
+            value
+        }
+        Err(error) => {
+            timings.insert("api".into(), json!(elapsed_ms(api_start)));
+            timings.insert("total".into(), json!(elapsed_ms(total_start)));
+            append_grade_record(
+                &app,
+                &config.memory_key,
+                build_grade_record(
+                    &record_id,
+                    unix_seconds(),
+                    &config,
+                    &input,
+                    "error",
+                    Value::Object(timings.clone()),
+                    Some(capture_path.display().to_string()),
+                    Some(error.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(record_path.display().to_string()),
+                ),
+            )?;
+            return Err(error);
+        }
+    };
+
+    let parse_start = Instant::now();
+    let mut result = match parse_grade_response(&raw, input.max_score) {
+        Ok(value) => {
+            timings.insert("parse".into(), json!(elapsed_ms(parse_start)));
+            value
+        }
+        Err(error) => {
+            timings.insert("parse".into(), json!(elapsed_ms(parse_start)));
+            timings.insert("total".into(), json!(elapsed_ms(total_start)));
+            append_grade_record(
+                &app,
+                &config.memory_key,
+                build_grade_record(
+                    &record_id,
+                    unix_seconds(),
+                    &config,
+                    &input,
+                    "error",
+                    Value::Object(timings.clone()),
+                    Some(capture_path.display().to_string()),
+                    Some(error.clone()),
+                    None,
+                    None,
+                    None,
+                    Some(raw),
+                    Some(record_path.display().to_string()),
+                ),
+            )?;
+            return Err(error);
+        }
+    };
+
+    timings.insert("total".into(), json!(elapsed_ms(total_start)));
+    result.record_id = record_id.clone();
+    result.record_path = record_path.display().to_string();
+    result.timings_ms = Value::Object(timings.clone());
+
+    append_grade_record(
+        &app,
+        &config.memory_key,
+        build_grade_record(
+            &record_id,
+            unix_seconds(),
+            &config,
+            &input,
+            "success",
+            Value::Object(timings),
+            Some(capture_path.display().to_string()),
+            None,
+            Some(&result),
+            Some(prompt.as_str()),
+            Some(image_url.len()),
+            Some(result.raw.clone()),
+            Some(record_path.display().to_string()),
+        ),
+    )?;
+
+    Ok(result)
 }
 
 fn close_selection_window(app: &AppHandle) -> Result<(), String> {
@@ -318,7 +538,12 @@ fn default_stored_config() -> StoredConfig {
     StoredConfig {
         base_url: "https://api.openai.com/v1".to_string(),
         model: "gpt-4.1-mini".to_string(),
+        memory_key: "default".to_string(),
     }
+}
+
+fn default_memory_key() -> String {
+    "default".to_string()
 }
 
 fn app_config_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -331,8 +556,26 @@ fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_config_dir(app)?.join(CONFIG_FILE))
 }
 
-fn memory_wiki_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app_config_dir(app)?.join(MEMORY_WIKI_FILE))
+fn memory_key_dir(app: &AppHandle, memory_key: &str) -> Result<PathBuf, String> {
+    let dir = app_config_dir(app)?
+        .join(MEMORIES_DIR)
+        .join(memory_key_dir_name(memory_key));
+    fs::create_dir_all(&dir).map_err(to_error)?;
+    Ok(dir)
+}
+
+fn memory_wiki_path_for_key(app: &AppHandle, memory_key: &str) -> Result<PathBuf, String> {
+    Ok(memory_key_dir(app, memory_key)?.join(MEMORY_WIKI_FILE))
+}
+
+fn grading_records_path_for_key(app: &AppHandle, memory_key: &str) -> Result<PathBuf, String> {
+    Ok(memory_key_dir(app, memory_key)?.join(GRADING_RECORDS_FILE))
+}
+
+fn captures_dir_for_key(app: &AppHandle, memory_key: &str) -> Result<PathBuf, String> {
+    let dir = memory_key_dir(app, memory_key)?.join(CAPTURES_DIR);
+    fs::create_dir_all(&dir).map_err(to_error)?;
+    Ok(dir)
 }
 
 fn read_stored_config(app: &AppHandle) -> Result<StoredConfig, String> {
@@ -348,6 +591,7 @@ fn read_stored_config(app: &AppHandle) -> Result<StoredConfig, String> {
     if stored.model.is_empty() {
         stored.model = default_stored_config().model;
     }
+    stored.memory_key = normalize_memory_key(&stored.memory_key);
     Ok(stored)
 }
 
@@ -381,6 +625,36 @@ fn normalize_base_url(base_url: &str) -> Result<String, String> {
     }
 
     Ok(normalized)
+}
+
+fn normalize_memory_key(memory_key: &str) -> String {
+    let trimmed = memory_key.trim();
+    if trimmed.is_empty() {
+        return default_memory_key();
+    }
+
+    trimmed.chars().take(80).collect()
+}
+
+fn memory_key_dir_name(memory_key: &str) -> String {
+    let normalized = normalize_memory_key(memory_key);
+    let sanitized = normalized
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect::<String>()
+        .trim_matches('.')
+        .trim()
+        .to_string();
+
+    if sanitized.is_empty() {
+        default_memory_key()
+    } else {
+        sanitized
+    }
 }
 
 fn validate_selection(selection: &SelectionRect) -> Result<(), String> {
@@ -505,14 +779,106 @@ fn data_url_from_png(png: &[u8]) -> String {
     )
 }
 
-fn read_memory_wiki_for_prompt(app: &AppHandle) -> Result<String, String> {
-    let path = memory_wiki_path(app)?;
+fn save_capture_png(
+    app: &AppHandle,
+    memory_key: &str,
+    record_id: &str,
+    png: &[u8],
+) -> Result<PathBuf, String> {
+    let path = captures_dir_for_key(app, memory_key)?.join(format!("{record_id}.png"));
+    fs::write(&path, png).map_err(to_error)?;
+    Ok(path)
+}
+
+fn append_grade_record(
+    app: &AppHandle,
+    memory_key: &str,
+    record: GradeRecord,
+) -> Result<(), String> {
+    let path = grading_records_path_for_key(app, memory_key)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(to_error)?;
+    let line = serde_json::to_string(&record).map_err(to_error)?;
+    writeln!(file, "{line}").map_err(to_error)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_grade_record(
+    record_id: &str,
+    timestamp: u64,
+    config: &StoredConfig,
+    input: &GradeInput,
+    status: &str,
+    timings_ms: Value,
+    capture_path: Option<String>,
+    error: Option<String>,
+    result: Option<&GradeResult>,
+    prompt: Option<&str>,
+    image_data_url_bytes: Option<usize>,
+    raw: Option<String>,
+    record_path: Option<String>,
+) -> GradeRecord {
+    GradeRecord {
+        id: record_id.to_string(),
+        timestamp,
+        memory_key: config.memory_key.clone(),
+        status: status.to_string(),
+        mode: input.mode.clone(),
+        model: config.model.clone(),
+        base_url: config.base_url.clone(),
+        max_score: input.max_score,
+        score: result.map(|value| value.score),
+        level: result
+            .map(|value| value.level.clone())
+            .filter(|value| !value.is_empty()),
+        error,
+        timings_ms,
+        selection: input.selection.clone(),
+        capture_path,
+        record_path,
+        extracted_text: result
+            .map(|value| value.extracted_text.clone())
+            .filter(|value| !value.is_empty()),
+        comments: result
+            .map(|value| value.comments.clone())
+            .filter(|value| !value.is_empty()),
+        raw: raw.or_else(|| result.map(|value| value.raw.clone())),
+        rubric_excerpt: memory_excerpt(&input.rubric, 1800),
+        reference_essay_excerpt: memory_excerpt(&input.reference_essay, 1800),
+        prompt_excerpt: prompt.map(|value| memory_excerpt(value, 2400)),
+        image_data_url_bytes,
+    }
+}
+
+fn read_memory_wiki_for_prompt(app: &AppHandle, memory_key: &str) -> Result<String, String> {
+    let path = memory_wiki_path_for_key(app, memory_key)?;
     if !path.exists() {
         return Ok(String::new());
     }
 
     let content = fs::read_to_string(path).map_err(to_error)?;
     Ok(tail_chars(&content, MEMORY_PROMPT_CHAR_LIMIT))
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    start.elapsed().as_millis() as u64
 }
 
 fn format_memory_wiki_entry(input: &CorrectionInput, corrected_score: f64) -> String {
@@ -694,6 +1060,9 @@ fn parse_grade_response(raw: &str, requested_max_score: f64) -> Result<GradeResu
     let score = clamp_score(parsed.score.unwrap_or(0.0), max_score);
 
     Ok(GradeResult {
+        record_id: String::new(),
+        record_path: String::new(),
+        timings_ms: json!({}),
         score,
         max_score,
         level: parsed.level.unwrap_or_default(),
@@ -772,6 +1141,7 @@ pub fn run() {
             confirm_selection,
             cancel_selection,
             save_score_correction,
+            load_grade_records,
             grade_selection
         ])
         .run(tauri::generate_context!())
@@ -840,6 +1210,9 @@ mod tests {
     fn memory_wiki_entry_records_correction() {
         let input = CorrectionInput {
             result: GradeResult {
+                record_id: "test-record".into(),
+                record_path: String::new(),
+                timings_ms: json!({}),
                 score: 52.0,
                 max_score: 60.0,
                 level: "A".into(),

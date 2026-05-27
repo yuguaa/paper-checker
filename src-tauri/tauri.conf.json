@@ -15,10 +15,10 @@
       {
         "label": "main",
         "title": "作文自动批改",
-        "width": 1200,
-        "height": 800,
-        "minWidth": 960,
-        "minHeight": 680,
+        "width": 1320,
+        "height": 840,
+        "minWidth": 1180,
+        "minHeight": 720,
         "resizable": true,
         "fullscreen": false
       }

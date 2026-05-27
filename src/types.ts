@@ -1,12 +1,14 @@
 export interface ModelConfig {
   baseUrl: string;
   model: string;
+  memoryKey: string;
   hasApiKey: boolean;
 }
 
 export interface ModelConfigInput {
   baseUrl: string;
   model: string;
+  memoryKey: string;
   apiKey?: string | null;
 }
 
@@ -28,6 +30,9 @@ export interface GradeInput {
 }
 
 export interface GradeResult {
+  recordId: string;
+  recordPath: string;
+  timingsMs: Record<string, number>;
   score: number;
   maxScore: number;
   level: string;
@@ -50,4 +55,22 @@ export interface CorrectionInput {
 export interface MemoryWikiSaveResult {
   path: string;
   entry: string;
+}
+
+export interface GradeRecord {
+  id: string;
+  timestamp: number;
+  memoryKey: string;
+  status: "success" | "error";
+  mode: string;
+  model: string;
+  maxScore: number;
+  score?: number;
+  level?: string;
+  error?: string;
+  timingsMs: Record<string, number>;
+  capturePath?: string;
+  recordPath?: string;
+  extractedText?: string;
+  comments?: string;
 }

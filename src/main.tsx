@@ -15,13 +15,14 @@ import {
   Target,
   Wand2
 } from "lucide-react";
-import type { GradeResult, MemoryWikiSaveResult, ModelConfig, SelectionRect } from "./types";
+import type { GradeRecord, GradeResult, MemoryWikiSaveResult, ModelConfig, SelectionRect } from "./types";
 import { invokeCommand, isTauri } from "./tauri";
 import "./styles.css";
 
 const defaultConfig: ModelConfig = {
   baseUrl: "https://api.openai.com/v1",
   model: "gpt-4.1-mini",
+  memoryKey: "default",
   hasApiKey: false
 };
 
@@ -36,6 +37,12 @@ function stringifyBreakdown(value: unknown) {
   return JSON.stringify(value, null, 2);
 }
 
+function formatMs(value: number | undefined) {
+  if (!Number.isFinite(value)) return "-";
+  if ((value ?? 0) >= 1000) return `${((value ?? 0) / 1000).toFixed(1)}s`;
+  return `${Math.round(value ?? 0)}ms`;
+}
+
 function App() {
   const [config, setConfig] = useState<ModelConfig>(defaultConfig);
   const [apiKey, setApiKey] = useState("");
@@ -47,6 +54,7 @@ function App() {
   const [correctedScore, setCorrectedScore] = useState("");
   const [correctionNote, setCorrectionNote] = useState("");
   const [memoryMessage, setMemoryMessage] = useState<string | null>(null);
+  const [records, setRecords] = useState<GradeRecord[]>([]);
   const [loading, setLoading] = useState<string | null>(null);
   const [status, setStatus] = useState("准备就绪");
   const [error, setError] = useState<string | null>(null);
@@ -58,7 +66,10 @@ function App() {
     }
 
     invokeCommand<ModelConfig>("load_model_config")
-      .then((loaded) => setConfig(loaded))
+      .then((loaded) => {
+        setConfig({ ...loaded, memoryKey: loaded.memoryKey || "default" });
+        return loadRecords();
+      })
       .catch((err) => setError(String(err)));
 
     let unlistenSelection: (() => void) | undefined;
@@ -103,6 +114,16 @@ function App() {
     setMemoryMessage(null);
   }, [result]);
 
+  async function loadRecords() {
+    if (!isTauri()) return;
+    try {
+      const loaded = await invokeCommand<GradeRecord[]>("load_grade_records");
+      setRecords(loaded);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
   const canGrade = useMemo(() => {
     return Boolean(
       selection &&
@@ -123,12 +144,14 @@ function App() {
         input: {
           baseUrl: config.baseUrl,
           model: config.model,
+          memoryKey: config.memoryKey,
           apiKey: apiKey.trim() ? apiKey.trim() : null
         }
       });
       setConfig(saved);
       setApiKey("");
-      setStatus("模型配置已保存");
+      await loadRecords();
+      setStatus("模型配置与记忆 Key 已保存");
     } catch (err) {
       setError(String(err));
     } finally {
@@ -170,6 +193,7 @@ function App() {
         }
       });
       setResult(graded);
+      await loadRecords();
       setStatus(mode === "auto" ? "自动阅卷完成" : "单次阅卷完成");
     } catch (err) {
       setError(String(err));
@@ -270,6 +294,14 @@ function App() {
             />
           </label>
           <label>
+            <span>Memory Key</span>
+            <input
+              value={config.memoryKey}
+              onChange={(event) => setConfig({ ...config, memoryKey: event.target.value })}
+              placeholder="default"
+            />
+          </label>
+          <label>
             <span>API Key</span>
             <input
               type="password"
@@ -363,6 +395,12 @@ function App() {
                 <span>/ {result.maxScore}</span>
                 <em>{result.level || "未分级"}</em>
               </div>
+              <div className="timing-strip">
+                <span>总耗时 {formatMs(result.timingsMs.total)}</span>
+                <span>截图 {formatMs(result.timingsMs.capture)}</span>
+                <span>模型 {formatMs(result.timingsMs.api)}</span>
+                <span>解析 {formatMs(result.timingsMs.parse)}</span>
+              </div>
               <section className="correction-box">
                 <div className="correction-title">
                   <PencilLine size={16} aria-hidden />
@@ -416,6 +454,36 @@ function App() {
               <span>阅卷结果会显示在这里</span>
             </div>
           )}
+          <section className="records-panel">
+            <div className="records-title">
+              <h3>评分记录</h3>
+              <button onClick={loadRecords} disabled={loading !== null}>刷新</button>
+            </div>
+            {records.length > 0 ? (
+              <div className="records-list">
+                {records.map((record) => (
+                  <article className="record-item" key={record.id} data-status={record.status}>
+                    <div>
+                      <strong>
+                        {record.status === "success"
+                          ? `${record.score?.toFixed(1) ?? "-"} / ${record.maxScore}`
+                          : "失败"}
+                      </strong>
+                      <span>{new Date(record.timestamp * 1000).toLocaleString()}</span>
+                    </div>
+                    <p>{record.status === "success" ? record.comments || record.extractedText || "已记录" : record.error}</p>
+                    <footer>
+                      <span>{record.model}</span>
+                      <span>总耗时 {formatMs(record.timingsMs?.total)}</span>
+                      <span>模型 {formatMs(record.timingsMs?.api)}</span>
+                    </footer>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <p className="records-empty">当前 Memory Key 还没有评分记录</p>
+            )}
+          </section>
         </section>
       </section>
     </main>

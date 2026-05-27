@@ -4,11 +4,12 @@
 
 ## 功能
 
-- 输入兼容 OpenAI SDK 的 `baseUrl`、`apiKey`、`model`
+- 输入兼容 OpenAI SDK 的 `baseUrl`、`apiKey`、`model`，并可设置 `Memory Key`
 - 框选试卷作文区域，确认后在屏幕上保留透明取景框
 - 输入评分标准、参考范文、满分
 - 使用视觉模型直接识别作文图片并返回分数、评语和改进建议
-- 支持人工订正分数，并把订正原因写入本地 `memory-wiki.md` 供后续阅卷参考
+- 支持人工订正分数，并按 `Memory Key` 隔离写入本地 `memory-wiki.md`
+- 保存评分记录、截图文件、模型返回和分段耗时，便于排查识别慢或评分异常
 - GitHub Actions 构建 Windows 与 macOS arm64 产物
 
 ## 开发
