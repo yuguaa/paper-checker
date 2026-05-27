@@ -1,0 +1,89 @@
+:root {
+  background: transparent;
+  color: #f8fffc;
+  font-family:
+    Inter, "SF Pro Display", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+  user-select: none;
+}
+
+button {
+  display: inline-grid;
+  width: 42px;
+  height: 38px;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 8px;
+  background: rgba(21, 35, 31, 0.94);
+  color: #f8fffc;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #1d6f5f;
+}
+
+.selection-overlay {
+  position: fixed;
+  inset: 0;
+  cursor: crosshair;
+  background: rgba(13, 18, 21, 0.16);
+}
+
+.selection-copy {
+  position: fixed;
+  left: 50%;
+  top: 22px;
+  transform: translateX(-50%);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 999px;
+  background: rgba(21, 35, 31, 0.86);
+  padding: 8px 14px;
+  color: #f8fffc;
+  font-size: 13px;
+  letter-spacing: 0;
+  pointer-events: none;
+}
+
+.selection-rect {
+  position: fixed;
+  border: 2px solid #1fbf9b;
+  border-radius: 6px;
+  background: rgba(31, 191, 155, 0.18);
+  box-shadow:
+    0 0 0 9999px rgba(13, 18, 21, 0.2),
+    0 10px 30px rgba(0, 0, 0, 0.18);
+  pointer-events: none;
+}
+
+.selection-toolbar {
+  position: fixed;
+  display: flex;
+  gap: 8px;
+  padding: 6px;
+  border-radius: 10px;
+  background: rgba(5, 10, 9, 0.72);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.24);
+}
+
+.selection-error {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  border: 1px solid rgba(255, 202, 184, 0.5);
+  border-radius: 8px;
+  background: rgba(94, 35, 22, 0.94);
+  color: #fff8f5;
+  padding: 10px 14px;
+  font-size: 13px;
+}

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Main and selection windows can use core Tauri APIs and local app commands.",
+  "windows": ["main", "selection"],
+  "permissions": ["core:default"]
+}
