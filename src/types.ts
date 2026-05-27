@@ -37,3 +37,17 @@ export interface GradeResult {
   suggestions: string;
   raw: string;
 }
+
+export interface CorrectionInput {
+  result: GradeResult;
+  correctedScore: number;
+  correctionNote: string;
+  rubric: string;
+  referenceEssay: string;
+  maxScore: number;
+}
+
+export interface MemoryWikiSaveResult {
+  path: string;
+  entry: string;
+}

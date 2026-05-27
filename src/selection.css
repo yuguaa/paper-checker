@@ -39,6 +39,11 @@ button:hover {
   background: rgba(13, 18, 21, 0.16);
 }
 
+.selection-overlay[data-confirmed="true"] {
+  cursor: default;
+  background: transparent;
+}
+
 .selection-copy {
   position: fixed;
   left: 50%;
@@ -63,6 +68,11 @@ button:hover {
     0 0 0 9999px rgba(13, 18, 21, 0.2),
     0 10px 30px rgba(0, 0, 0, 0.18);
   pointer-events: none;
+}
+
+.selection-overlay[data-confirmed="true"] .selection-rect {
+  background: rgba(31, 191, 155, 0.05);
+  box-shadow: none;
 }
 
 .selection-toolbar {

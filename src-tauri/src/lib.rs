@@ -1,8 +1,10 @@
 use std::{
-    fs,
-    io::Cursor,
+    fs::{self, OpenOptions},
+    io::{Cursor, Write},
     path::PathBuf,
     sync::Mutex,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{engine::general_purpose, Engine as _};
@@ -18,6 +20,8 @@ use xcap::Monitor;
 const SERVICE_NAME: &str = "com.paper-checker.app";
 const KEYCHAIN_ACCOUNT: &str = "openai-compatible-api-key";
 const CONFIG_FILE: &str = "config.json";
+const MEMORY_WIKI_FILE: &str = "memory-wiki.md";
+const MEMORY_PROMPT_CHAR_LIMIT: usize = 6000;
 
 #[derive(Default)]
 struct AppState {
@@ -81,6 +85,24 @@ pub struct GradeResult {
     raw: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CorrectionInput {
+    result: GradeResult,
+    corrected_score: f64,
+    correction_note: String,
+    rubric: String,
+    reference_essay: String,
+    max_score: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryWikiSaveResult {
+    path: String,
+    entry: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PartialGradeResult {
@@ -119,14 +141,16 @@ async fn save_model_config(app: AppHandle, input: ModelConfigInput) -> Result<Mo
         return Err("模型名称不能为空".into());
     }
 
-    if let Some(api_key) = input.api_key.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(api_key) = input
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         write_api_key(api_key)?;
     }
 
-    let stored = StoredConfig {
-        base_url,
-        model,
-    };
+    let stored = StoredConfig { base_url, model };
     write_stored_config(&app, &stored)?;
 
     Ok(ModelConfig {
@@ -139,18 +163,25 @@ async fn save_model_config(app: AppHandle, input: ModelConfigInput) -> Result<Mo
 #[tauri::command]
 async fn open_selection_window(app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("selection") {
+        window.set_ignore_cursor_events(false).map_err(to_error)?;
+        window.show().map_err(to_error)?;
         window.set_focus().map_err(to_error)?;
+        window.emit("selection-reset", ()).map_err(to_error)?;
         return Ok(());
     }
+
+    let (x, y, width, height) = primary_monitor_logical_bounds(&app)?;
 
     WebviewWindowBuilder::new(&app, "selection", WebviewUrl::App("selection.html".into()))
         .title("框选作文区域")
         .decorations(false)
         .transparent(true)
         .always_on_top(true)
-        .fullscreen(true)
+        .position(x, y)
+        .inner_size(width, height)
         .skip_taskbar(true)
         .resizable(false)
+        .shadow(false)
         .focused(true)
         .build()
         .map_err(to_error)?;
@@ -165,22 +196,61 @@ async fn confirm_selection(
     selection: SelectionRect,
 ) -> Result<(), String> {
     validate_selection(&selection)?;
-    *state.latest_selection.lock().map_err(|_| "选区状态已被占用")? = Some(selection.clone());
-    close_selection_window(&app)?;
-    app.emit("selection-confirmed", selection).map_err(to_error)?;
+    *state
+        .latest_selection
+        .lock()
+        .map_err(|_| "选区状态已被占用")? = Some(selection.clone());
+    if let Some(window) = app.get_webview_window("selection") {
+        window.set_ignore_cursor_events(true).map_err(to_error)?;
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_focus();
+    }
+    app.emit("selection-confirmed", selection)
+        .map_err(to_error)?;
     Ok(())
 }
 
 #[tauri::command]
-async fn cancel_selection(app: AppHandle) -> Result<(), String> {
+async fn cancel_selection(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    *state
+        .latest_selection
+        .lock()
+        .map_err(|_| "选区状态已被占用")? = None;
     close_selection_window(&app)?;
+    app.emit("selection-cleared", ()).map_err(to_error)?;
     Ok(())
 }
 
 #[tauri::command]
-async fn capture_selection_preview(selection: SelectionRect) -> Result<String, String> {
-    let png = capture_selection_png(&selection)?;
-    Ok(data_url_from_png(&png))
+async fn save_score_correction(
+    app: AppHandle,
+    input: CorrectionInput,
+) -> Result<MemoryWikiSaveResult, String> {
+    validate_correction_input(&input)?;
+    let corrected_score = clamp_score(input.corrected_score, input.max_score);
+    let path = memory_wiki_path(&app)?;
+    let needs_header = !path.exists()
+        || fs::metadata(&path)
+            .map(|meta| meta.len() == 0)
+            .unwrap_or(true);
+    let entry = format_memory_wiki_entry(&input, corrected_score);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(to_error)?;
+
+    if needs_header {
+        file.write_all(b"# Essay Grading Memory Wiki\n\n")
+            .map_err(to_error)?;
+    }
+    file.write_all(entry.as_bytes()).map_err(to_error)?;
+
+    Ok(MemoryWikiSaveResult {
+        path: path.display().to_string(),
+        entry,
+    })
 }
 
 #[tauri::command]
@@ -188,10 +258,11 @@ async fn grade_selection(app: AppHandle, input: GradeInput) -> Result<GradeResul
     validate_grade_input(&input)?;
     let config = read_stored_config(&app)?;
     let api_key = read_api_key().map_err(|_| "请先保存 API Key".to_string())?;
-    let png = capture_selection_png(&input.selection)?;
+    let png = capture_selection_png_for_grading(&app, &input.selection)?;
     let image_url = data_url_from_png(&png);
     let endpoint = format!("{}/chat/completions", normalize_base_url(&config.base_url)?);
-    let prompt = build_grading_prompt(&input);
+    let memory_wiki = read_memory_wiki_for_prompt(&app)?;
+    let prompt = build_grading_prompt(&input, &memory_wiki);
 
     let request_body = json!({
         "model": config.model,
@@ -226,6 +297,23 @@ fn close_selection_window(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn primary_monitor_logical_bounds(app: &AppHandle) -> Result<(f64, f64, f64, f64), String> {
+    let monitor = app
+        .primary_monitor()
+        .map_err(to_error)?
+        .ok_or_else(|| "未检测到主显示器".to_string())?;
+    let scale = monitor.scale_factor().max(0.1);
+    let position = monitor.position();
+    let size = monitor.size();
+
+    Ok((
+        position.x as f64 / scale,
+        position.y as f64 / scale,
+        size.width as f64 / scale,
+        size.height as f64 / scale,
+    ))
+}
+
 fn default_stored_config() -> StoredConfig {
     StoredConfig {
         base_url: "https://api.openai.com/v1".to_string(),
@@ -233,10 +321,18 @@ fn default_stored_config() -> StoredConfig {
     }
 }
 
-fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
+fn app_config_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_config_dir().map_err(to_error)?;
     fs::create_dir_all(&dir).map_err(to_error)?;
-    Ok(dir.join(CONFIG_FILE))
+    Ok(dir)
+}
+
+fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app_config_dir(app)?.join(CONFIG_FILE))
+}
+
+fn memory_wiki_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app_config_dir(app)?.join(MEMORY_WIKI_FILE))
 }
 
 fn read_stored_config(app: &AppHandle) -> Result<StoredConfig, String> {
@@ -311,6 +407,19 @@ fn validate_grade_input(input: &GradeInput) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_correction_input(input: &CorrectionInput) -> Result<(), String> {
+    if input.max_score <= 0.0 {
+        return Err("满分必须大于 0".into());
+    }
+    if !input.corrected_score.is_finite() {
+        return Err("订正分数格式不正确".into());
+    }
+    if input.corrected_score < 0.0 || input.corrected_score > input.max_score {
+        return Err(format!("订正分数必须在 0 到 {} 之间", input.max_score));
+    }
+    Ok(())
+}
+
 fn rect_to_physical(selection: &SelectionRect) -> PhysicalSelection {
     let scale = selection.scale_factor.max(0.1);
     PhysicalSelection {
@@ -331,15 +440,11 @@ fn capture_selection_png(selection: &SelectionRect) -> Result<Vec<u8>, String> {
 
     let x = physical.x.clamp(0, monitor_width.saturating_sub(1));
     let y = physical.y.clamp(0, monitor_height.saturating_sub(1));
-    let width = physical
-        .width
-        .min((monitor_width - x).max(1) as u32);
-    let height = physical
-        .height
-        .min((monitor_height - y).max(1) as u32);
+    let width = physical.width.min((monitor_width - x).max(1) as u32);
+    let height = physical.height.min((monitor_height - y).max(1) as u32);
 
     let image = monitor
-        .capture_region(x, y, width, height)
+        .capture_region(x as u32, y as u32, width, height)
         .map_err(map_capture_error)?;
 
     let mut cursor = Cursor::new(Vec::new());
@@ -347,6 +452,26 @@ fn capture_selection_png(selection: &SelectionRect) -> Result<Vec<u8>, String> {
         .write_to(&mut cursor, ImageFormat::Png)
         .map_err(to_error)?;
     Ok(cursor.into_inner())
+}
+
+fn capture_selection_png_for_grading(
+    app: &AppHandle,
+    selection: &SelectionRect,
+) -> Result<Vec<u8>, String> {
+    let marker = app.get_webview_window("selection");
+    if let Some(window) = marker.as_ref() {
+        let _ = window.hide();
+        thread::sleep(Duration::from_millis(80));
+    }
+
+    let captured = capture_selection_png(selection);
+
+    if let Some(window) = marker.as_ref() {
+        let _ = window.show();
+        let _ = window.set_ignore_cursor_events(true);
+    }
+
+    captured
 }
 
 fn choose_monitor(mut monitors: Vec<Monitor>, monitor_id: &str) -> Result<Monitor, String> {
@@ -380,7 +505,94 @@ fn data_url_from_png(png: &[u8]) -> String {
     )
 }
 
-fn build_grading_prompt(input: &GradeInput) -> String {
+fn read_memory_wiki_for_prompt(app: &AppHandle) -> Result<String, String> {
+    let path = memory_wiki_path(app)?;
+    if !path.exists() {
+        return Ok(String::new());
+    }
+
+    let content = fs::read_to_string(path).map_err(to_error)?;
+    Ok(tail_chars(&content, MEMORY_PROMPT_CHAR_LIMIT))
+}
+
+fn format_memory_wiki_entry(input: &CorrectionInput, corrected_score: f64) -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let delta = corrected_score - input.result.score;
+    let note = if input.correction_note.trim().is_empty() {
+        "未填写"
+    } else {
+        input.correction_note.trim()
+    };
+
+    format!(
+        r#"## Correction {timestamp}
+
+- Max score: {max_score}
+- Model score: {model_score}
+- Corrected score: {corrected_score}
+- Delta: {delta}
+- Correction note: {note}
+- Rubric excerpt: {rubric}
+- Reference essay excerpt: {reference_essay}
+- Extracted essay excerpt: {extracted_text}
+- Model comments excerpt: {comments}
+
+"#,
+        timestamp = timestamp,
+        max_score = input.max_score,
+        model_score = input.result.score,
+        corrected_score = corrected_score,
+        delta = format!("{delta:.2}"),
+        note = memory_excerpt(note, 900),
+        rubric = memory_excerpt(&input.rubric, 1200),
+        reference_essay = memory_excerpt(&input.reference_essay, 1200),
+        extracted_text = memory_excerpt(&input.result.extracted_text, 1600),
+        comments = memory_excerpt(&input.result.comments, 900),
+    )
+}
+
+fn memory_excerpt(value: &str, max_chars: usize) -> String {
+    let normalized = value
+        .trim()
+        .replace('\r', "")
+        .split('\n')
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" / ");
+
+    if normalized.chars().count() <= max_chars {
+        normalized
+    } else {
+        format!(
+            "{}...",
+            normalized.chars().take(max_chars).collect::<String>()
+        )
+    }
+}
+
+fn tail_chars(value: &str, max_chars: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return value.to_string();
+    }
+
+    chars[chars.len() - max_chars..].iter().collect()
+}
+
+fn build_grading_prompt(input: &GradeInput, memory_wiki: &str) -> String {
+    let memory_section = if memory_wiki.trim().is_empty() {
+        "暂无人工订正记忆。".to_string()
+    } else {
+        format!(
+            "以下是用户过去手动订正形成的 Memory Wiki。它反映用户对分数松紧、扣分偏好和特殊题型的校准；如果它与当前评分标准冲突，以当前评分标准为准。\n{}",
+            memory_wiki.trim()
+        )
+    };
+
     format!(
         r#"请识别图片中的作文正文，并根据评分标准与参考范文给出批改结果。
 
@@ -392,6 +604,9 @@ fn build_grading_prompt(input: &GradeInput) -> String {
 
 参考范文：
 {reference_essay}
+
+人工订正 Memory Wiki：
+{memory_section}
 
 只返回一个 JSON 对象，不要返回 Markdown，不要包裹代码块。字段必须使用以下英文 key：
 {{
@@ -413,11 +628,16 @@ fn build_grading_prompt(input: &GradeInput) -> String {
         mode = input.mode,
         max_score = input.max_score,
         rubric = input.rubric.trim(),
-        reference_essay = input.reference_essay.trim()
+        reference_essay = input.reference_essay.trim(),
+        memory_section = memory_section
     )
 }
 
-async fn call_chat_completions(endpoint: &str, api_key: &str, body: &Value) -> Result<String, String> {
+async fn call_chat_completions(
+    endpoint: &str,
+    api_key: &str,
+    body: &Value,
+) -> Result<String, String> {
     let response = reqwest::Client::new()
         .post(endpoint)
         .bearer_auth(api_key)
@@ -434,8 +654,12 @@ async fn call_chat_completions(endpoint: &str, api_key: &str, body: &Value) -> R
 
     let value: Value = serde_json::from_str(&text)
         .map_err(|_| format!("模型接口返回了非 JSON 响应：{}", compact(&text)))?;
-    extract_message_content(&value)
-        .ok_or_else(|| format!("模型响应缺少 choices[0].message.content：{}", compact(&text)))
+    extract_message_content(&value).ok_or_else(|| {
+        format!(
+            "模型响应缺少 choices[0].message.content：{}",
+            compact(&text)
+        )
+    })
 }
 
 fn extract_message_content(value: &Value) -> Option<String> {
@@ -499,7 +723,10 @@ fn clamp_score(score: f64, max_score: f64) -> f64 {
 
 fn format_model_http_error(status: StatusCode, body: &str) -> String {
     match status.as_u16() {
-        400 => format!("模型接口拒绝请求，可能是不支持图片输入或请求格式不兼容：{}", compact(body)),
+        400 => format!(
+            "模型接口拒绝请求，可能是不支持图片输入或请求格式不兼容：{}",
+            compact(body)
+        ),
         401 | 403 => "模型接口鉴权失败，请检查 API Key".to_string(),
         404 => "模型接口地址不存在，请检查 Base URL 是否已经包含 /v1".to_string(),
         429 => "模型接口限流，请稍后重试".to_string(),
@@ -544,7 +771,7 @@ pub fn run() {
             open_selection_window,
             confirm_selection,
             cancel_selection,
-            capture_selection_preview,
+            save_score_correction,
             grade_selection
         ])
         .run(tauri::generate_context!())
@@ -607,5 +834,70 @@ mod tests {
     #[test]
     fn reports_non_json_model_output() {
         assert!(parse_grade_response("不是 JSON", 60.0).is_err());
+    }
+
+    #[test]
+    fn memory_wiki_entry_records_correction() {
+        let input = CorrectionInput {
+            result: GradeResult {
+                score: 52.0,
+                max_score: 60.0,
+                level: "A".into(),
+                extracted_text: "这是一篇作文。".into(),
+                breakdown: json!([]),
+                comments: "模型认为结构完整。".into(),
+                suggestions: "继续保持。".into(),
+                raw: "{}".into(),
+            },
+            corrected_score: 46.0,
+            correction_note: "跑题较明显，需要更严格扣分。".into(),
+            rubric: "立意、内容、结构、语言。".into(),
+            reference_essay: "参考范文。".into(),
+            max_score: 60.0,
+        };
+
+        let entry = format_memory_wiki_entry(&input, 46.0);
+        assert!(entry.contains("Model score: 52"));
+        assert!(entry.contains("Corrected score: 46"));
+        assert!(entry.contains("跑题较明显"));
+    }
+
+    #[test]
+    fn grading_prompt_includes_memory_wiki() {
+        let input = GradeInput {
+            selection: SelectionRect {
+                monitor_id: "primary".into(),
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+                scale_factor: 1.0,
+            },
+            rubric: "评分标准".into(),
+            reference_essay: "参考范文".into(),
+            max_score: 60.0,
+            mode: "single".into(),
+        };
+
+        let prompt = build_grading_prompt(&input, "历史订正：跑题扣 8 分");
+        assert!(prompt.contains("Memory Wiki"));
+        assert!(prompt.contains("跑题扣 8 分"));
+    }
+
+    #[test]
+    #[ignore = "requires an interactive desktop session with screen capture permission"]
+    fn captures_primary_monitor_region_as_png() {
+        let selection = SelectionRect {
+            monitor_id: "primary".into(),
+            x: 0.0,
+            y: 0.0,
+            width: 128.0,
+            height: 128.0,
+            scale_factor: 1.0,
+        };
+
+        let png = capture_selection_png(&selection).expect("capture primary monitor region");
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(png.len() > 128);
     }
 }

@@ -5,18 +5,17 @@ import {
   Aperture,
   Bot,
   CheckCircle2,
-  Eye,
   FileText,
   KeyRound,
   Loader2,
+  PencilLine,
   Play,
-  RotateCcw,
   Save,
   Sparkles,
   Target,
   Wand2
 } from "lucide-react";
-import type { GradeResult, ModelConfig, SelectionRect } from "./types";
+import type { GradeResult, MemoryWikiSaveResult, ModelConfig, SelectionRect } from "./types";
 import { invokeCommand, isTauri } from "./tauri";
 import "./styles.css";
 
@@ -41,11 +40,13 @@ function App() {
   const [config, setConfig] = useState<ModelConfig>(defaultConfig);
   const [apiKey, setApiKey] = useState("");
   const [selection, setSelection] = useState<SelectionRect | null>(null);
-  const [preview, setPreview] = useState<string | null>(null);
   const [rubric, setRubric] = useState("");
   const [referenceEssay, setReferenceEssay] = useState("");
   const [maxScore, setMaxScore] = useState(60);
   const [result, setResult] = useState<GradeResult | null>(null);
+  const [correctedScore, setCorrectedScore] = useState("");
+  const [correctionNote, setCorrectionNote] = useState("");
+  const [memoryMessage, setMemoryMessage] = useState<string | null>(null);
   const [loading, setLoading] = useState<string | null>(null);
   const [status, setStatus] = useState("准备就绪");
   const [error, setError] = useState<string | null>(null);
@@ -60,25 +61,47 @@ function App() {
       .then((loaded) => setConfig(loaded))
       .catch((err) => setError(String(err)));
 
-    let unlisten: (() => void) | undefined;
+    let unlistenSelection: (() => void) | undefined;
+    let unlistenCleared: (() => void) | undefined;
     listen<SelectionRect>("selection-confirmed", (event) => {
       const confirmedSelection = event.payload;
       setSelection(confirmedSelection);
-      setStatus("选区已确认");
+      setStatus("取景框已固定");
       setError(null);
-      window.setTimeout(() => {
-        invokeCommand<string>("capture_selection_preview", { selection: confirmedSelection })
-          .then(setPreview)
-          .catch((err) => setError(String(err)));
-      }, 180);
     })
       .then((stop) => {
-        unlisten = stop;
+        unlistenSelection = stop;
       })
       .catch((err) => setError(String(err)));
 
-    return () => unlisten?.();
+    listen("selection-cleared", () => {
+      setSelection(null);
+      setStatus("选区已取消");
+      setError(null);
+    })
+      .then((stop) => {
+        unlistenCleared = stop;
+      })
+      .catch((err) => setError(String(err)));
+
+    return () => {
+      unlistenSelection?.();
+      unlistenCleared?.();
+    };
   }, []);
+
+  useEffect(() => {
+    if (!result) {
+      setCorrectedScore("");
+      setCorrectionNote("");
+      setMemoryMessage(null);
+      return;
+    }
+
+    setCorrectedScore(String(result.score));
+    setCorrectionNote("");
+    setMemoryMessage(null);
+  }, [result]);
 
   const canGrade = useMemo(() => {
     return Boolean(
@@ -118,22 +141,7 @@ function App() {
     setError(null);
     try {
       await invokeCommand("open_selection_window");
-      setStatus("正在框选作文区域");
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setLoading(null);
-    }
-  }
-
-  async function refreshPreview() {
-    if (!selection) return;
-    setLoading("preview");
-    setError(null);
-    try {
-      const image = await invokeCommand<string>("capture_selection_preview", { selection });
-      setPreview(image);
-      setStatus("选区预览已更新");
+      setStatus(selection ? "正在重新框选作文区域" : "正在框选作文区域");
     } catch (err) {
       setError(String(err));
     } finally {
@@ -150,6 +158,7 @@ function App() {
     setLoading(mode);
     setError(null);
     setResult(null);
+    setMemoryMessage(null);
     try {
       const graded = await invokeCommand<GradeResult>("grade_selection", {
         input: {
@@ -168,6 +177,55 @@ function App() {
       setLoading(null);
     }
   }
+
+  async function saveCorrection() {
+    if (!result) return;
+
+    const score = Number(correctedScore);
+    if (!Number.isFinite(score) || score < 0 || score > maxScore) {
+      setError(`订正分数必须在 0 到 ${maxScore} 之间`);
+      return;
+    }
+
+    setLoading("correction");
+    setError(null);
+    try {
+      const saved = await invokeCommand<MemoryWikiSaveResult>("save_score_correction", {
+        input: {
+          result,
+          correctedScore: score,
+          correctionNote,
+          rubric,
+          referenceEssay,
+          maxScore
+        }
+      });
+      setResult({ ...result, score });
+      setMemoryMessage(`已写入 Memory Wiki：${saved.path}`);
+      setStatus("人工订正已保存");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(null);
+    }
+  }
+
+  const selectionBoxStyle = useMemo<React.CSSProperties>(() => {
+    if (!selection) return {};
+
+    const ratio = selection.width / selection.height;
+    if (ratio >= 1) {
+      return {
+        width: "78%",
+        aspectRatio: `${selection.width} / ${selection.height}`
+      };
+    }
+
+    return {
+      height: "74%",
+      aspectRatio: `${selection.width} / ${selection.height}`
+    };
+  }, [selection]);
 
   return (
     <main className="app-shell">
@@ -231,28 +289,20 @@ function App() {
             <Aperture size={18} aria-hidden />
             <h2>作文选区</h2>
           </div>
-          <div className="preview-frame">
-            {preview ? (
-              <img src={preview} alt="作文选区预览" />
-            ) : (
-              <div className="empty-preview">
-                <Eye size={28} aria-hidden />
-                <span>{formatRect(selection)}</span>
-              </div>
-            )}
+          <div className="selection-frame" data-ready={Boolean(selection)}>
+            <div className="selection-frame-box" style={selectionBoxStyle}>
+              <Target size={28} aria-hidden />
+            </div>
+            <span>{selection ? "屏幕取景框已保留" : "未选择取景框"}</span>
           </div>
           <div className="selection-meta">
             <span>{formatRect(selection)}</span>
             <span>{selection ? `缩放 ${selection.scaleFactor.toFixed(2)}` : "等待框选"}</span>
           </div>
-          <div className="button-row">
+          <div className="button-row single">
             <button onClick={openSelectionWindow} disabled={loading === "selection"}>
               <Target size={17} />
-              框选作文
-            </button>
-            <button onClick={refreshPreview} disabled={!selection || loading === "preview"}>
-              {loading === "preview" ? <Loader2 className="spin" size={17} /> : <RotateCcw size={17} />}
-              更新预览
+              {selection ? "重新框选" : "框选作文"}
             </button>
           </div>
         </section>
@@ -313,6 +363,36 @@ function App() {
                 <span>/ {result.maxScore}</span>
                 <em>{result.level || "未分级"}</em>
               </div>
+              <section className="correction-box">
+                <div className="correction-title">
+                  <PencilLine size={16} aria-hidden />
+                  <h3>人工订正</h3>
+                </div>
+                <div className="correction-grid">
+                  <label>
+                    <span>订正分数</span>
+                    <input
+                      className="score-input"
+                      type="number"
+                      min={0}
+                      max={maxScore}
+                      value={correctedScore}
+                      onChange={(event) => setCorrectedScore(event.target.value)}
+                    />
+                  </label>
+                  <button onClick={saveCorrection} disabled={loading === "correction"}>
+                    {loading === "correction" ? <Loader2 className="spin" size={17} /> : <Save size={17} />}
+                    写入 Memory Wiki
+                  </button>
+                </div>
+                <textarea
+                  className="correction-note"
+                  value={correctionNote}
+                  onChange={(event) => setCorrectionNote(event.target.value)}
+                  placeholder="记录你为什么改分，后续阅卷会参考这条订正规则"
+                />
+                {memoryMessage ? <p className="memory-message">{memoryMessage}</p> : null}
+              </section>
               <section>
                 <h3>评语</h3>
                 <p>{result.comments || "暂无评语"}</p>
