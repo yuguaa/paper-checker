@@ -99,6 +99,7 @@ pub struct GradeResult {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CorrectionInput {
+    selection: SelectionRect,
     result: GradeResult,
     corrected_score: f64,
     correction_note: String,
@@ -276,6 +277,7 @@ async fn save_score_correction(
     let config = read_stored_config(&app)?;
     let corrected_score = clamp_score(input.corrected_score, input.max_score);
     let path = memory_wiki_path_for_key(&app, &config.memory_key)?;
+    let record_path = grading_records_path_for_key(&app, &config.memory_key)?;
     let needs_header = !path.exists()
         || fs::metadata(&path)
             .map(|meta| meta.len() == 0)
@@ -292,6 +294,55 @@ async fn save_score_correction(
             .map_err(to_error)?;
     }
     file.write_all(entry.as_bytes()).map_err(to_error)?;
+
+    append_grade_record(
+        &app,
+        &config.memory_key,
+        GradeRecord {
+            id: format!("correction-{}", unix_millis()),
+            timestamp: unix_seconds(),
+            memory_key: config.memory_key.clone(),
+            status: "correction".to_string(),
+            mode: "correction".to_string(),
+            model: config.model.clone(),
+            base_url: config.base_url.clone(),
+            max_score: input.max_score,
+            score: Some(corrected_score),
+            level: if input.result.level.is_empty() {
+                None
+            } else {
+                Some(input.result.level.clone())
+            },
+            error: None,
+            timings_ms: json!({
+                "correction": 0,
+                "total": 0,
+                "sourceTotal": input.result.timings_ms.clone()
+            }),
+            selection: input.selection.clone(),
+            capture_path: None,
+            record_path: Some(record_path.display().to_string()),
+            extracted_text: if input.result.extracted_text.is_empty() {
+                None
+            } else {
+                Some(input.result.extracted_text.clone())
+            },
+            comments: if input.correction_note.trim().is_empty() {
+                if input.result.comments.is_empty() {
+                    None
+                } else {
+                    Some(input.result.comments.clone())
+                }
+            } else {
+                Some(input.correction_note.trim().to_string())
+            },
+            raw: Some(input.result.raw.clone()),
+            rubric_excerpt: memory_excerpt(&input.rubric, 1800),
+            reference_essay_excerpt: memory_excerpt(&input.reference_essay, 1800),
+            prompt_excerpt: None,
+            image_data_url_bytes: None,
+        },
+    )?;
 
     Ok(MemoryWikiSaveResult {
         path: path.display().to_string(),
@@ -1209,6 +1260,14 @@ mod tests {
     #[test]
     fn memory_wiki_entry_records_correction() {
         let input = CorrectionInput {
+            selection: SelectionRect {
+                monitor_id: "primary".into(),
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+                scale_factor: 1.0,
+            },
             result: GradeResult {
                 record_id: "test-record".into(),
                 record_path: String::new(),

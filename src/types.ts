@@ -44,6 +44,7 @@ export interface GradeResult {
 }
 
 export interface CorrectionInput {
+  selection: SelectionRect;
   result: GradeResult;
   correctedScore: number;
   correctionNote: string;
@@ -61,7 +62,7 @@ export interface GradeRecord {
   id: string;
   timestamp: number;
   memoryKey: string;
-  status: "success" | "error";
+  status: "success" | "error" | "correction";
   mode: string;
   model: string;
   maxScore: number;

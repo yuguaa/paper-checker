@@ -43,6 +43,12 @@ function formatMs(value: number | undefined) {
   return `${Math.round(value ?? 0)}ms`;
 }
 
+function recordTitle(record: GradeRecord) {
+  if (record.status === "error") return "失败";
+  if (record.status === "correction") return `订正 ${record.score?.toFixed(1) ?? "-"} / ${record.maxScore}`;
+  return `${record.score?.toFixed(1) ?? "-"} / ${record.maxScore}`;
+}
+
 function App() {
   const [config, setConfig] = useState<ModelConfig>(defaultConfig);
   const [apiKey, setApiKey] = useState("");
@@ -203,7 +209,7 @@ function App() {
   }
 
   async function saveCorrection() {
-    if (!result) return;
+    if (!result || !selection) return;
 
     const score = Number(correctedScore);
     if (!Number.isFinite(score) || score < 0 || score > maxScore) {
@@ -217,6 +223,7 @@ function App() {
       const saved = await invokeCommand<MemoryWikiSaveResult>("save_score_correction", {
         input: {
           result,
+          selection,
           correctedScore: score,
           correctionNote,
           rubric,
@@ -226,6 +233,7 @@ function App() {
       });
       setResult({ ...result, score });
       setMemoryMessage(`已写入 Memory Wiki：${saved.path}`);
+      await loadRecords();
       setStatus("人工订正已保存");
     } catch (err) {
       setError(String(err));
@@ -465,13 +473,11 @@ function App() {
                   <article className="record-item" key={record.id} data-status={record.status}>
                     <div>
                       <strong>
-                        {record.status === "success"
-                          ? `${record.score?.toFixed(1) ?? "-"} / ${record.maxScore}`
-                          : "失败"}
+                        {recordTitle(record)}
                       </strong>
                       <span>{new Date(record.timestamp * 1000).toLocaleString()}</span>
                     </div>
-                    <p>{record.status === "success" ? record.comments || record.extractedText || "已记录" : record.error}</p>
+                    <p>{record.status === "error" ? record.error : record.comments || record.extractedText || "已记录"}</p>
                     <footer>
                       <span>{record.model}</span>
                       <span>总耗时 {formatMs(record.timingsMs?.total)}</span>
